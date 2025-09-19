@@ -43,6 +43,25 @@ const JunitTestSuite = struct {
     }
 };
 
+const ShrinkList = struct {
+    items: []TestCase,
+
+    fn remove(self: *ShrinkList, ix: usize) TestCase {
+        if (self.items.len - 1 == ix) return self.pop().?;
+
+        const old_item = self.items[ix];
+        self.items[ix] = self.pop().?;
+        return old_item;
+    }
+
+    pub fn pop(self: *ShrinkList) ?TestCase {
+        if (self.items.len == 0) return null;
+        const val = self.items[self.items.len - 1];
+        self.items.len -= 1;
+        return val;
+    }
+};
+
 const TestCase = struct {
     name: []const u8,
     message: []const u8,
@@ -63,6 +82,18 @@ const TestCase = struct {
         _ = try writer.write("}");
     }
 };
+
+fn countScalar(haystack: []u8, needle: u8) usize {
+    var i: usize = 0;
+    var found: usize = 0;
+
+    while (std.mem.indexOfScalarPos(u8, haystack, i, needle)) |idx| {
+        i = idx + 1;
+        found += 1;
+    }
+
+    return found;
+}
 
 fn readHeader(reader: *Reader) JunitErr!void {
     const header = reader.peekDelimiterInclusive('>') catch |err| {
@@ -171,10 +202,7 @@ fn readTestcase(alloc: Allocator, reader: *Reader, testCase: *TestCase) (Reader.
     return true;
 }
 
-fn checkJunit(allocator: Allocator, pwd: Dir, path: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+fn checkJunit(alloc: Allocator, pwd: Dir, path: []const u8) !void {
     var file = try pwd.openFile(path, .{ .mode = .read_only });
     defer file.close();
 
@@ -191,36 +219,55 @@ fn checkJunit(allocator: Allocator, pwd: Dir, path: []const u8) !void {
 
     try dropProperties(reader);
 
+    // TODO: Resolve path relative to pwd
     const baseFile = try alloc.dupe(u8, testSuite.name);
     std.mem.replaceScalar(u8, baseFile, '.', '/');
+    //
+    // HACK: Make it dynamic, take language as config/argument
     const testfpath = try std.mem.concat(alloc, u8, &.{ "src/test/kotlin/", baseFile, ".kt" });
     const testfile = pwd.openFile(testfpath, .{}) catch |err| {
-        const here = try std.fs.cwd().realpathAlloc(alloc, ".");
+        const here = try pwd.realpathAlloc(alloc, ".");
         std.log.warn("File {s} could not be opened from {s}: {any}", .{ testfpath, here, err });
         return err;
     };
+
     defer testfile.close();
     var tf_buf: [4 * 1024]u8 = undefined;
     var testreader = testfile.reader(&tf_buf);
     var tfread = &testreader.interface;
 
-    var line: usize = 0;
     for (0..testSuite.testCases.len) |ix| {
         const testCase: *TestCase = @constCast(&testSuite.testCases[ix]);
         while (!(readTestcase(alloc, reader, testCase) catch {
             return;
         })) {}
-        while (true) {
-            line += 1;
-            const testline = tfread.takeDelimiterExclusive('\n') catch |err| {
-                if (err == Reader.DelimiterError.EndOfStream) {
-                    testreader.pos = 0;
-                    line = 0;
-                    continue;
-                }
-                return err;
-            };
+    }
+
+    var allTests: ShrinkList = .{ .items = testSuite.testCases };
+    std.debug.print("{s} {d}\n", .{ testfpath, allTests.items.len });
+
+    var line: usize = 1;
+    while (true) next: {
+        const block = tfread.takeDelimiterInclusive('@') catch |err| switch (err) {
+            Reader.DelimiterError.EndOfStream => unreachable,
+            Reader.DelimiterError.StreamTooLong => {
+                line += countScalar(tfread.buffer, '\n');
+                tfread.toss(tfread.buffer.len);
+                continue;
+            },
+            else => return err,
+        };
+        line += countScalar(block, '\n') + 1;
+        const annotation = try tfread.takeDelimiterExclusive('\n');
+        if (!std.mem.startsWith(u8, "Test", annotation)) continue;
+        const testline = try tfread.takeDelimiterInclusive('\n');
+        line += 1;
+
+        for (0..allTests.items.len) |ix| {
+            const testCase = allTests.items[ix];
             if (std.mem.indexOf(u8, testline, testCase.name)) |pos| {
+                @branchHint(.unlikely);
+                _ = allTests.remove(ix);
                 _ = try stdout.write(testfpath);
                 _ = try stdout.writeByte(':');
                 _ = try stdout.printInt(line, 10, .lower, .{});
@@ -229,7 +276,13 @@ fn checkJunit(allocator: Allocator, pwd: Dir, path: []const u8) !void {
                 _ = try stdout.writeByte(':');
                 _ = try stdout.write(testCase.message);
                 _ = try stdout.writeByte('\n');
-                break;
+
+                if (allTests.items.len == 0) {
+                    try stdout.flush();
+                    return;
+                }
+
+                break :next;
             }
         }
     }
@@ -238,8 +291,11 @@ fn checkJunit(allocator: Allocator, pwd: Dir, path: []const u8) !void {
 
 pub fn main() !void {
     var base = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = base.allocator();
+    const allocator = base.allocator();
     defer _ = base.deinit() == .ok;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     var args = std.process.args();
     _ = args.skip(); // first arg is binary name
@@ -247,18 +303,22 @@ pub fn main() !void {
     var pwd = try std.fs.cwd().openDir(target, .{ .iterate = true });
     defer pwd.close();
 
-    var walker = try pwd.walk(alloc);
+    var walker = try pwd.walk(allocator);
     defer walker.deinit();
     while (try walker.next()) |entry| switch (entry.kind) {
         .file => {
             if (std.mem.endsWith(u8, entry.basename, ".xml")) {
-                checkJunit(alloc, pwd, entry.path) catch |err| switch (err) {
-                    JunitErr.InvalidXml => std.log.err("File {s} is not a valid xml file", .{entry.basename}),
-                    JunitErr.NotJunit => {},
-                    else => {
-                        std.log.debug("Error: {any}", .{err});
-                    },
+                checkJunit(alloc, pwd, entry.path) catch |err| {
+                    switch (err) {
+                        JunitErr.InvalidXml => std.log.err("File {s} is not a valid xml file", .{entry.basename}),
+                        JunitErr.NotJunit => {},
+                        else => {
+                            std.log.debug("Error: {any}", .{err});
+                        },
+                    }
+                    continue;
                 };
+                _ = arena.reset(.retain_capacity);
             }
         },
         else => {},
