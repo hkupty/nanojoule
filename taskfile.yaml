@@ -1,0 +1,17 @@
+---
+version: "3"
+tasks:
+  build:
+    sources:
+      - src/**.zig
+      - ./build.zig
+      - ./build.zig.zon
+    generates:
+      - ./zig-out/bin/nj
+    cmds:
+      - zig build --release=fast install
+  install:
+    deps:
+      - build
+    cmds:
+      - cp ./zig-out/bin/nj ~/.local/bin/nj
