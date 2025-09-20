@@ -244,7 +244,6 @@ fn checkJunit(alloc: Allocator, pwd: Dir, path: []const u8) !void {
     }
 
     var allTests: ShrinkList = .{ .items = testSuite.testCases };
-    std.debug.print("{s} {d}\n", .{ testfpath, allTests.items.len });
 
     var line: usize = 0;
     while (true) next: {
