@@ -305,7 +305,7 @@ pub fn main() !void {
 
     var args = std.process.args();
     _ = args.skip(); // first arg is binary name
-    const target = args.next() orelse ".";
+    const target = args.next() orelse "build";
     var pwd = try std.fs.cwd().openDir(target, .{ .iterate = true });
     defer pwd.close();
 
