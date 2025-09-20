@@ -9,6 +9,12 @@ var stdout_buffer: [4 * 1024]u8 = undefined;
 var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
 var stdout = &stdout_writer.interface;
 
+var fpath: [std.fs.max_path_bytes]u8 = undefined;
+
+const Lang = enum {
+    kotlin,
+};
+
 const JunitErr = error{
     EndOfTests,
     InvalidXml,
@@ -202,12 +208,9 @@ fn readTestcase(alloc: Allocator, reader: *Reader, testCase: *TestCase) (Reader.
     return true;
 }
 
-fn checkJunit(alloc: Allocator, pwd: Dir, path: []const u8) !void {
-    var file = try pwd.openFile(path, .{ .mode = .read_only });
-    defer file.close();
-
+fn checkJunit(alloc: Allocator, baseTestPath: []const u8, testpwd: Dir, junitFile: File) !void {
     var readBuffer: [4 * 1024]u8 = undefined;
-    var freader = file.reader(&readBuffer);
+    var freader = junitFile.reader(&readBuffer);
     const reader = &freader.interface;
 
     try readHeader(reader);
@@ -224,10 +227,12 @@ fn checkJunit(alloc: Allocator, pwd: Dir, path: []const u8) !void {
     std.mem.replaceScalar(u8, baseFile, '.', '/');
     //
     // HACK: Make it dynamic, take language as config/argument
-    const testfpath = try std.mem.concat(alloc, u8, &.{ "src/test/kotlin/", baseFile, ".kt" });
-    const testfile = pwd.openFile(testfpath, .{}) catch |err| {
-        const here = try pwd.realpathAlloc(alloc, ".");
-        std.log.warn("File {s} could not be opened from {s}: {any}", .{ testfpath, here, err });
+    @memcpy(fpath[0..baseFile.len], baseFile);
+    @memcpy(fpath[baseFile.len..][0..3], ".kt");
+
+    const testfile = testpwd.openFile(fpath[0..(baseFile.len + 3)], .{}) catch |err| {
+        const here = try testpwd.realpathAlloc(alloc, ".");
+        std.log.warn("File {s} could not be opened from {s}: {any}", .{ fpath, here, err });
         return err;
     };
 
@@ -267,7 +272,9 @@ fn checkJunit(alloc: Allocator, pwd: Dir, path: []const u8) !void {
             if (std.mem.indexOf(u8, testline, testCase.name)) |pos| {
                 @branchHint(.unlikely);
                 _ = allTests.remove(ix);
-                _ = try stdout.write(testfpath);
+                _ = try stdout.write(baseTestPath);
+                _ = try stdout.writeByte(std.fs.path.sep);
+                _ = try stdout.write(baseFile);
                 _ = try stdout.writeByte(':');
                 _ = try stdout.printInt(line, 10, .lower, .{});
                 _ = try stdout.writeByte(':');
@@ -302,12 +309,32 @@ pub fn main() !void {
     var pwd = try std.fs.cwd().openDir(target, .{ .iterate = true });
     defer pwd.close();
 
+    // TODO: Config
+    const lang: Lang = .kotlin;
+
+    const testRoot = switch (lang) {
+        // TODO: Make it comptime/os-independent
+        .kotlin => "src/test/kotlin/",
+    };
+
+    var testpwd = std.fs.cwd().openDir(testRoot, .{}) catch |err| {
+        const cwd = try std.fs.cwd().realpath(".", &fpath);
+        std.log.warn("{s}: Folder {s} could not be opened in root {s}", .{ @errorName(err), testRoot, cwd });
+        return err;
+    };
+    defer testpwd.close();
+
     var walker = try pwd.walk(allocator);
     defer walker.deinit();
     while (try walker.next()) |entry| switch (entry.kind) {
         .file => {
             if (std.mem.endsWith(u8, entry.basename, ".xml")) {
-                checkJunit(alloc, pwd, entry.path) catch |err| {
+                var junitFile = pwd.openFile(entry.path, .{}) catch |err| {
+                    std.log.warn("Error {s} with file {s}", .{ @errorName(err), entry.path });
+                    return err;
+                };
+                defer junitFile.close();
+                checkJunit(alloc, testRoot, testpwd, junitFile) catch |err| {
                     switch (err) {
                         JunitErr.InvalidXml => std.log.err("File {s} is not a valid xml file", .{entry.basename}),
                         JunitErr.NotJunit => {},
